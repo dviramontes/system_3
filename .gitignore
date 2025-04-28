@@ -18,6 +18,8 @@ vendor/
 
 # Environment variables
 .env
+.envrc
 .env.local
 
-
+# go binary
+app

@@ -9,14 +9,23 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/invopop/jsonschema"
 )
 
+// Version is set during build through ldflags
+var Version = "dev"
+
 func main() {
-	tools := []ToolDefinition{ReadFileToolDefinition, ListFilesDefinition, EditFileDefinition}
+	tools := []ToolDefinition{ReadFileToolDefinition, ListFilesDefinition, EditFileDefinition, GitToolDefinition}
 	client := anthropic.NewClient()
+
+	fmt.Printf("System 3 version %s\n", Version)
 
 	scanner := bufio.NewScanner(os.Stdin)
 	getUserMessage := func() (string, bool) {
@@ -321,4 +330,294 @@ func createNewFile(filePath, content string) (string, error) {
 	}
 
 	return fmt.Sprintf("Successfully created file %s", filePath), nil
+}
+
+// Git tool definition
+
+var GitToolDefinition = ToolDefinition{
+	Name:        "git",
+	Description: "Perform Git operations like init, clone, add, commit, and status on repositories",
+	InputSchema: GitInputSchema,
+	Function:    GitOperation,
+}
+
+type GitInput struct {
+	Command    string `json:"command" jsonschema_description:"Git command to execute. Supported commands: init, clone, add, commit, status, log, branch"`
+	Path       string `json:"path,omitempty" jsonschema_description:"Path where the repository is located or should be created"`
+	URL        string `json:"url,omitempty" jsonschema_description:"URL of the repository to clone"`
+	Files      string `json:"files,omitempty" jsonschema_description:"Files to add, comma-separated or glob pattern"`
+	Message    string `json:"message,omitempty" jsonschema_description:"Commit message"`
+	BranchName string `json:"branch_name,omitempty" jsonschema_description:"Branch name for branch operations"`
+}
+
+var GitInputSchema = GenerateSchema[GitInput]()
+
+func GitOperation(input json.RawMessage) (string, error) {
+	gitInput := GitInput{}
+	err := json.Unmarshal(input, &gitInput)
+	if err != nil {
+		return "", err
+	}
+
+	// Set default path to current directory if not provided
+	if gitInput.Path == "" {
+		gitInput.Path = "."
+	}
+
+	switch gitInput.Command {
+	case "init":
+		return gitInit(gitInput.Path)
+	case "clone":
+		return gitClone(gitInput.URL, gitInput.Path)
+	case "add":
+		return gitAdd(gitInput.Path, gitInput.Files)
+	case "commit":
+		return gitCommit(gitInput.Path, gitInput.Message)
+	case "status":
+		return gitStatus(gitInput.Path)
+	case "log":
+		return gitLog(gitInput.Path)
+	case "branch":
+		return gitBranch(gitInput.Path, gitInput.BranchName)
+	case "reset":
+		return gitReset(gitInput.Path)
+	default:
+		return "", fmt.Errorf("unsupported git command: %s", gitInput.Command)
+	}
+}
+
+func gitInit(path string) (string, error) {
+	_, err := git.PlainInit(path, false)
+	if err != nil {
+		return "", fmt.Errorf("failed to initialize git repository: %w", err)
+	}
+
+	return fmt.Sprintf("Initialized empty Git repository in %s", path), nil
+}
+
+func gitClone(url, path string) (string, error) {
+	if url == "" {
+		return "", fmt.Errorf("URL is required for clone operation")
+	}
+
+	_, err := git.PlainClone(path, false, &git.CloneOptions{
+		URL: url,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to clone repository: %w", err)
+	}
+
+	return fmt.Sprintf("Cloned repository %s to %s", url, path), nil
+}
+
+func gitAdd(path, files string) (string, error) {
+	if files == "" {
+		return "", fmt.Errorf("files parameter is required for add operation")
+	}
+
+	r, err := git.PlainOpen(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to open repository: %w", err)
+	}
+
+	w, err := r.Worktree()
+	if err != nil {
+		return "", fmt.Errorf("failed to get worktree: %w", err)
+	}
+
+	// Handle comma-separated file list
+	fileList := strings.Split(files, ",")
+	for _, file := range fileList {
+		file = strings.TrimSpace(file)
+		_, err := w.Add(file)
+		if err != nil {
+			return "", fmt.Errorf("failed to add file %s: %w", file, err)
+		}
+	}
+
+	return fmt.Sprintf("Added files: %s", files), nil
+}
+
+func gitCommit(path, message string) (string, error) {
+	if message == "" {
+		return "", fmt.Errorf("commit message is required")
+	}
+
+	r, err := git.PlainOpen(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to open repository: %w", err)
+	}
+
+	w, err := r.Worktree()
+	if err != nil {
+		return "", fmt.Errorf("failed to get worktree: %w", err)
+	}
+
+	commit, err := w.Commit(message, &git.CommitOptions{
+		Author: &object.Signature{
+			Name:  "Claude",
+			Email: "claude@anthropic.com",
+			When:  time.Now(),
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to commit: %w", err)
+	}
+
+	obj, err := r.CommitObject(commit)
+	if err != nil {
+		return "", fmt.Errorf("failed to get commit object: %w", err)
+	}
+
+	return fmt.Sprintf("Created commit: %s with message: %s", obj.Hash, message), nil
+}
+
+func gitStatus(path string) (string, error) {
+	r, err := git.PlainOpen(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to open repository: %w", err)
+	}
+
+	w, err := r.Worktree()
+	if err != nil {
+		return "", fmt.Errorf("failed to get worktree: %w", err)
+	}
+
+	status, err := w.Status()
+	if err != nil {
+		return "", fmt.Errorf("failed to get status: %w", err)
+	}
+
+	return status.String(), nil
+}
+
+func gitLog(path string) (string, error) {
+	r, err := git.PlainOpen(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to open repository: %w", err)
+	}
+
+	// Get HEAD reference
+	ref, err := r.Head()
+	if err != nil {
+		return "", fmt.Errorf("failed to get HEAD: %w", err)
+	}
+
+	// Get commit history
+	logIter, err := r.Log(&git.LogOptions{From: ref.Hash()})
+	if err != nil {
+		return "", fmt.Errorf("failed to get log: %w", err)
+	}
+
+	var commits []string
+	// Only get the last 10 commits to avoid overwhelming output
+	count := 0
+	err = logIter.ForEach(func(c *object.Commit) error {
+		if count >= 10 {
+			return nil
+		}
+		commitInfo := fmt.Sprintf("commit %s\nAuthor: %s <%s>\nDate: %s\n\n    %s\n",
+			c.Hash,
+			c.Author.Name,
+			c.Author.Email,
+			c.Author.When.Format("Mon Jan 2 15:04:05 2006 -0700"),
+			c.Message)
+		commits = append(commits, commitInfo)
+		count++
+		return nil
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("failed to iterate over commits: %w", err)
+	}
+
+	if len(commits) == 0 {
+		return "No commits found", nil
+	}
+
+	return strings.Join(commits, "\n"), nil
+}
+
+func gitBranch(path, branchName string) (string, error) {
+	if branchName == "" {
+		// List branches if no branch name provided
+		return listBranches(path)
+	}
+
+	// Create new branch
+	r, err := git.PlainOpen(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to open repository: %w", err)
+	}
+
+	// Get HEAD reference
+	head, err := r.Head()
+	if err != nil {
+		return "", fmt.Errorf("failed to get HEAD: %w", err)
+	}
+
+	// Create new branch reference
+	ref := plumbing.NewHashReference(plumbing.NewBranchReferenceName(branchName), head.Hash())
+
+	// Save branch
+	err = r.Storer.SetReference(ref)
+	if err != nil {
+		return "", fmt.Errorf("failed to create branch: %w", err)
+	}
+
+	return fmt.Sprintf("Created branch: %s", branchName), nil
+}
+
+func gitReset(path string) (string, error) {
+	r, err := git.PlainOpen(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to open repository: %w", err)
+	}
+
+	w, err := r.Worktree()
+	if err != nil {
+		return "", fmt.Errorf("failed to get worktree: %w", err)
+	}
+
+	err = w.Reset(&git.ResetOptions{
+		Mode: git.HardReset,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to reset: %w", err)
+	}
+
+	return fmt.Sprintf("Reset to HEAD"), nil
+}
+
+//func gitMerge(path, branchName string) (string, error) return fmt.Sprintf("Merged branch %s into HEAD", branchName), nil
+//})
+
+func listBranches(path string) (string, error) {
+	r, err := git.PlainOpen(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to open repository: %w", err)
+	}
+
+	// Get branches
+	branches, err := r.Branches()
+	if err != nil {
+		return "", fmt.Errorf("failed to get branches: %w", err)
+	}
+
+	var branchList []string
+	err = branches.ForEach(func(ref *plumbing.Reference) error {
+		branchName := ref.Name().Short()
+		branchList = append(branchList, branchName)
+		return nil
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("failed to iterate over branches: %w", err)
+	}
+
+	if len(branchList) == 0 {
+		return "No branches found", nil
+	}
+
+	return strings.Join(branchList, "\n"), nil
 }

@@ -13,6 +13,7 @@ import (
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/invopop/jsonschema"
@@ -342,7 +343,7 @@ var GitToolDefinition = ToolDefinition{
 }
 
 type GitInput struct {
-	Command    string `json:"command" jsonschema_description:"Git command to execute. Supported commands: init, clone, add, commit, status, log, branch"`
+	Command    string `json:"command" jsonschema_description:"Git command to execute. Supported commands: init, clone, add, commit, status, log, branch, diff, reset"`
 	Path       string `json:"path,omitempty" jsonschema_description:"Path where the repository is located or should be created"`
 	URL        string `json:"url,omitempty" jsonschema_description:"URL of the repository to clone"`
 	Files      string `json:"files,omitempty" jsonschema_description:"Files to add, comma-separated or glob pattern"`
@@ -381,6 +382,8 @@ func GitOperation(input json.RawMessage) (string, error) {
 		return gitBranch(gitInput.Path, gitInput.BranchName)
 	case "reset":
 		return gitReset(gitInput.Path)
+	case "diff":
+		return gitDiff(gitInput.Path, gitInput.Files)
 	default:
 		return "", fmt.Errorf("unsupported git command: %s", gitInput.Command)
 	}
@@ -443,6 +446,15 @@ func gitCommit(path, message string) (string, error) {
 		return "", fmt.Errorf("commit message is required")
 	}
 
+	// Load global git config to get user name and email
+	cfg, err := config.LoadConfig(config.GlobalScope)
+	if err != nil {
+		return "", fmt.Errorf("failed to load git config: %w", err)
+	}
+	if cfg.User.Name == "" || cfg.User.Email == "" {
+		return "", fmt.Errorf("git config user.name or user.email not set globally")
+	}
+
 	r, err := git.PlainOpen(path)
 	if err != nil {
 		return "", fmt.Errorf("failed to open repository: %w", err)
@@ -455,8 +467,8 @@ func gitCommit(path, message string) (string, error) {
 
 	commit, err := w.Commit(message, &git.CommitOptions{
 		Author: &object.Signature{
-			Name:  "Claude",
-			Email: "claude@anthropic.com",
+			Name:  cfg.User.Name,
+			Email: cfg.User.Email,
 			When:  time.Now(),
 		},
 	})
@@ -587,6 +599,137 @@ func gitReset(path string) (string, error) {
 	}
 
 	return fmt.Sprintf("Reset to HEAD"), nil
+}
+
+func gitDiff(path, files string) (string, error) {
+	r, err := git.PlainOpen(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to open repository: %w", err)
+	}
+
+	w, err := r.Worktree()
+	if err != nil {
+		return "", fmt.Errorf("failed to get worktree: %w", err)
+	}
+
+	// Get the current worktree status
+	status, err := w.Status()
+	if err != nil {
+		return "", fmt.Errorf("failed to get status: %w", err)
+	}
+
+	// If no files are specified, show diff for all modified files
+	if files == "" {
+		var output strings.Builder
+		for filePath, fileStatus := range status {
+			if fileStatus.Worktree != git.Unmodified || fileStatus.Staging != git.Unmodified {
+				diffOutput, err := diffFile(r, w, filePath)
+				if err != nil {
+					output.WriteString(fmt.Sprintf("Error getting diff for %s: %s\n", filePath, err))
+					continue
+				}
+				if diffOutput != "" {
+					output.WriteString(fmt.Sprintf("--- a/%s\n+++ b/%s\n%s\n", filePath, filePath, diffOutput))
+				}
+			}
+		}
+		if output.Len() == 0 {
+			return "No changes detected", nil
+		}
+		return output.String(), nil
+	}
+
+	// Show diff for specific files
+	fileList := strings.Split(files, ",")
+	var output strings.Builder
+	for _, filePath := range fileList {
+		filePath = strings.TrimSpace(filePath)
+		diffOutput, err := diffFile(r, w, filePath)
+		if err != nil {
+			output.WriteString(fmt.Sprintf("Error getting diff for %s: %s\n", filePath, err))
+			continue
+		}
+		if diffOutput != "" {
+			output.WriteString(fmt.Sprintf("--- a/%s\n+++ b/%s\n%s\n", filePath, filePath, diffOutput))
+		}
+	}
+
+	if output.Len() == 0 {
+		return "No changes detected in specified files", nil
+	}
+
+	return output.String(), nil
+}
+
+// Helper function to get diff for a single file
+func diffFile(r *git.Repository, w *git.Worktree, filePath string) (string, error) {
+	// Get the current file content
+	currentContentBytes, err := os.ReadFile(path.Join(w.Filesystem.Root(), filePath))
+	if err != nil {
+		// File might be deleted
+		if os.IsNotExist(err) {
+			return "File deleted", nil
+		}
+		return "", err
+	}
+	currentContent := string(currentContentBytes)
+
+	// Try to get HEAD commit
+	head, err := r.Head()
+	if err != nil {
+		// Repository might be empty or HEAD might not exist yet
+		return fmt.Sprintf("New file: %s\n%s", filePath, currentContent), nil
+	}
+
+	// Get the commit object
+	commit, err := r.CommitObject(head.Hash())
+	if err != nil {
+		return "", err
+	}
+
+	// Get the file from HEAD
+	fileInHead, err := commit.File(filePath)
+	if err != nil {
+		// File might be new
+		return fmt.Sprintf("New file: %s\n%s", filePath, currentContent), nil
+	}
+
+	// Get the content from HEAD
+	previousContent, err := fileInHead.Contents()
+	if err != nil {
+		return "", err
+	}
+
+	// No changes
+	if previousContent == currentContent {
+		return "", nil
+	}
+
+	// Simple line-by-line diff
+	prevLines := strings.Split(previousContent, "\n")
+	currLines := strings.Split(currentContent, "\n")
+
+	// Basic diff output
+	var output strings.Builder
+	for i, line := range currLines {
+		if i < len(prevLines) {
+			if line != prevLines[i] {
+				output.WriteString(fmt.Sprintf("-  %s\n+  %s\n", prevLines[i], line))
+			}
+		} else {
+			// New lines added
+			output.WriteString(fmt.Sprintf("+  %s\n", line))
+		}
+	}
+
+	// Check for removed lines
+	if len(prevLines) > len(currLines) {
+		for i := len(currLines); i < len(prevLines); i++ {
+			output.WriteString(fmt.Sprintf("-  %s\n", prevLines[i]))
+		}
+	}
+
+	return output.String(), nil
 }
 
 //func gitMerge(path, branchName string) (string, error) return fmt.Sprintf("Merged branch %s into HEAD", branchName), nil

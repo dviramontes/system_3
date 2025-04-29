@@ -8,7 +8,7 @@ default:
 # Build the Go application
 build:
     @echo "Building application..."
-    go build -o bin/app .
+    go build -ldflags "-X main.Version=$(cat .version)" -o s3 .
 
 # Format Go code
 fmt:
@@ -20,13 +20,18 @@ test:
     @echo "Running tests..."
     go test -v ./...
 
+# Install the binary to Go bin path
+install:
+    @echo "Installing to Go bin path..."
+    go build -ldflags "-X main.Version=$(cat .version)" -o "$(go env GOPATH)/bin/s3"
+
 # Run linter
 lint:
     @echo "Running linter..."
     golangci-lint run
 
 # Run the application
-run:
+dev:
     @echo "Running application..."
     go run .
 

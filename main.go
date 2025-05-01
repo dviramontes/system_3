@@ -4,9 +4,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -142,7 +142,9 @@ func (a *Agent) runInterface(ctc context.Context, conversation []anthropic.Messa
 		})
 	}
 	return a.client.Messages.New(ctc, anthropic.MessageNewParams{
-		Model:     anthropic.ModelClaude3_7SonnetLatest,
+		// Model:     anthropic.ModelClaude3_7SonnetLatest,
+		// Claude 3.5 Sonnet 2024-10-22
+		Model:     anthropic.ModelClaude3_5Sonnet20241022,
 		MaxTokens: int64(1024),
 		Messages:  conversation,
 		Tools:     anthropicTools,
@@ -317,9 +319,9 @@ func EditFile(input json.RawMessage) (string, error) {
 }
 
 func createNewFile(filePath, content string) (string, error) {
-	dir := path.Dir(filePath)
-	if dir != "." {
-		err := os.MkdirAll(dir, 0755)
+	dirPath := filepath.Dir(filePath)
+	if dirPath != "." {
+		err := os.MkdirAll(dirPath, 0755)
 		if err != nil {
 			return "", fmt.Errorf("failed to create directory: %w", err)
 		}
@@ -337,13 +339,13 @@ func createNewFile(filePath, content string) (string, error) {
 
 var GitToolDefinition = ToolDefinition{
 	Name:        "git",
-	Description: "Perform Git operations like init, clone, add, commit, and status on repositories",
+	Description: "Perform Git operations like init, clone, add, commit, fetch, and status on repositories",
 	InputSchema: GitInputSchema,
 	Function:    GitOperation,
 }
 
 type GitInput struct {
-	Command    string `json:"command" jsonschema_description:"Git command to execute. Supported commands: init, clone, add, commit, status, log, branch, diff, reset"`
+	Command    string `json:"command" jsonschema_description:"Git command to execute. Supported commands: init, clone, add, commit, status, log, branch, diff, reset, fetch, remote-update, checkout"`
 	Path       string `json:"path,omitempty" jsonschema_description:"Path where the repository is located or should be created"`
 	URL        string `json:"url,omitempty" jsonschema_description:"URL of the repository to clone"`
 	Files      string `json:"files,omitempty" jsonschema_description:"Files to add, comma-separated or glob pattern"`
@@ -384,6 +386,10 @@ func GitOperation(input json.RawMessage) (string, error) {
 		return gitReset(gitInput.Path)
 	case "diff":
 		return gitDiff(gitInput.Path, gitInput.Files)
+	case "fetch":
+		return gitFetch(gitInput.Path, gitInput.BranchName)
+	case "checkout":
+		return gitCheckout(gitInput.Path, gitInput.BranchName)
 	default:
 		return "", fmt.Errorf("unsupported git command: %s", gitInput.Command)
 	}
@@ -664,7 +670,7 @@ func gitDiff(path, files string) (string, error) {
 // Helper function to get diff for a single file
 func diffFile(r *git.Repository, w *git.Worktree, filePath string) (string, error) {
 	// Get the current file content
-	currentContentBytes, err := os.ReadFile(path.Join(w.Filesystem.Root(), filePath))
+	currentContentBytes, err := os.ReadFile(filepath.Join(w.Filesystem.Root(), filePath))
 	if err != nil {
 		// File might be deleted
 		if os.IsNotExist(err) {
@@ -732,8 +738,114 @@ func diffFile(r *git.Repository, w *git.Worktree, filePath string) (string, erro
 	return output.String(), nil
 }
 
-//func gitMerge(path, branchName string) (string, error) return fmt.Sprintf("Merged branch %s into HEAD", branchName), nil
-//})
+func gitFetch(path string, branchName string) (string, error) {
+	r, err := git.PlainOpen(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to open repository: %w", err)
+	}
+
+	// Get the default remote (origin)
+	remoteName := "origin"
+	_, err = r.Remote(remoteName)
+	if err != nil {
+		// Try to find any remote if origin doesn't exist
+		remotes, remErr := r.Remotes()
+		if remErr != nil || len(remotes) == 0 {
+			return "", fmt.Errorf("no remotes found: %w", err)
+		}
+		// Use the first available remote
+		remoteName = remotes[0].Config().Name
+	}
+
+	// Create fetch options
+	fetchOpts := &git.FetchOptions{
+		RemoteName: remoteName,
+		Force:      false,
+	}
+
+	// If a specific branch is requested, fetch only that branch
+	if branchName != "" {
+		// Construct proper refspec for the branch
+		refSpec := config.RefSpec(fmt.Sprintf("refs/heads/%s:refs/remotes/%s/%s", branchName, remoteName, branchName))
+		fetchOpts.RefSpecs = []config.RefSpec{refSpec}
+	}
+
+	// Perform the fetch
+	err = r.Fetch(fetchOpts)
+
+	// Handle common errors
+	if err != nil {
+		if errors.Is(err, git.NoErrAlreadyUpToDate) {
+			if branchName != "" {
+				return fmt.Sprintf("Branch '%s' is already up-to-date", branchName), nil
+			}
+			return "Repository is already up-to-date", nil
+		} else if err.Error() == "authentication required" || strings.Contains(strings.ToLower(err.Error()), "auth") {
+			return "Authentication failed: please provide valid credentials using the username and password parameters", nil
+		} else {
+			return "", fmt.Errorf("fetch failed: %w", err)
+		}
+	}
+
+	// Success message
+	if branchName != "" {
+		return fmt.Sprintf("Successfully fetched updates from '%s' for branch '%s'", remoteName, branchName), nil
+	}
+	return fmt.Sprintf("Successfully fetched all updates from '%s'", remoteName), nil
+}
+
+func gitCheckout(path, branchName string) (string, error) {
+	if branchName == "" {
+		return "", fmt.Errorf("branch name is required for checkout operation")
+	}
+
+	r, err := git.PlainOpen(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to open repository: %w", err)
+	}
+
+	w, err := r.Worktree()
+	if err != nil {
+		return "", fmt.Errorf("failed to get worktree: %w", err)
+	}
+
+	// First try to find the branch locally
+	branchRef := plumbing.NewBranchReferenceName(branchName)
+
+	// Check if the branch exists locally
+	_, err = r.Reference(branchRef, true)
+
+	// If the branch doesn't exist locally, check if it exists as a remote branch
+	if err != nil {
+		// Check if it's a remote branch that we need to create locally
+		remoteRef := plumbing.NewRemoteReferenceName("origin", branchName)
+		remoteRefObj, err := r.Reference(remoteRef, true)
+
+		if err == nil {
+			// Remote branch exists, create a local branch tracking the remote one
+			// Equivalent to: git checkout -b <branch> origin/<branch>
+			refName := plumbing.NewBranchReferenceName(branchName)
+			ref := plumbing.NewSymbolicReference(refName, remoteRefObj.Name())
+
+			err = r.Storer.SetReference(ref)
+			if err != nil {
+				return "", fmt.Errorf("failed to create local branch from remote: %w", err)
+			}
+		}
+	}
+
+	// Perform the checkout
+	err = w.Checkout(&git.CheckoutOptions{
+		Branch: branchRef,
+		Force:  false,
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("failed to checkout branch '%s': %w", branchName, err)
+	}
+
+	return fmt.Sprintf("Switched to branch '%s'", branchName), nil
+}
 
 func listBranches(path string) (string, error) {
 	r, err := git.PlainOpen(path)
@@ -741,26 +853,26 @@ func listBranches(path string) (string, error) {
 		return "", fmt.Errorf("failed to open repository: %w", err)
 	}
 
-	// Get branches
-	branches, err := r.Branches()
+	branchRefs, err := r.Branches()
 	if err != nil {
-		return "", fmt.Errorf("failed to get branches: %w", err)
+		return "", fmt.Errorf("failed to list branches: %w", err)
 	}
 
-	var branchList []string
-	err = branches.ForEach(func(ref *plumbing.Reference) error {
-		branchName := ref.Name().Short()
-		branchList = append(branchList, branchName)
+	var branches []string
+	err = branchRefs.ForEach(func(ref *plumbing.Reference) error {
+		branch := ref.Name().Short()
+		if branch != "" {
+			branches = append(branches, branch)
+		}
 		return nil
 	})
-
 	if err != nil {
 		return "", fmt.Errorf("failed to iterate over branches: %w", err)
 	}
 
-	if len(branchList) == 0 {
+	if len(branches) == 0 {
 		return "No branches found", nil
 	}
 
-	return strings.Join(branchList, "\n"), nil
+	return strings.Join(branches, "\n"), nil
 }
